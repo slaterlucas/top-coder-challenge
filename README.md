@@ -31,6 +31,16 @@ The system takes three inputs:
 
 - `public_cases.json` - 1,000 historical input/output examples
 
+## Inspecting Edge Cases
+
+Use `find_edge_cases.py` to quickly view extreme values in the dataset.
+
+```bash
+python find_edge_cases.py              # uses private_cases.json by default
+python find_edge_cases.py public_cases.json -n 3  # show first 3 cases at each extreme
+```
+
+
 ## Getting Started
 
 1. **Analyze the data**: 
