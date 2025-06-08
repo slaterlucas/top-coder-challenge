@@ -9,188 +9,173 @@ import ruptures as rpt
 import matplotlib.pyplot as plt
 
 
-def load_cases(path: str) -> pd.DataFrame:
-    """Load JSON cases file into DataFrame."""
+def load_data(path="public_cases.json"):
     with open(path, "r") as f:
         data = json.load(f)
-    records = []
-    for case in data:
-        inp = case.get("input", {})
-        days = inp.get("trip_duration_days")
-        receipts = inp.get("total_receipts_amount")
-        records.append(
-            {
-                "days": days,
-                "miles": inp.get("miles_traveled"),
-                "receipts": receipts,
-                "payout": case.get("expected_output"),
-                "spd": receipts / days if days else 0,
-            }
-        )
-    return pd.DataFrame(records)
+    return data
 
 
-def filter_cases(
-    df: pd.DataFrame,
-    days_min: int,
-    days_max: int,
-    miles_min: float,
-    miles_max: float,
-) -> pd.DataFrame:
-    mask = (
-        (df["days"] >= days_min)
-        & (df["days"] <= days_max)
-        & (df["miles"] >= miles_min)
-        & (df["miles"] <= miles_max)
-    )
-    return df.loc[mask].copy()
-
-
-def compute_local_slope(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values("spd").reset_index(drop=True)
-    slopes = np.gradient(df["payout"], df["spd"])
-    df["local_slope"] = slopes
+def build_dataframe(cases):
+    rows = []
+    for c in cases:
+        inp = c.get("input", {})
+        rows.append({
+            "days": inp.get("trip_duration_days"),
+            "miles": inp.get("miles_traveled"),
+            "receipts": inp.get("total_receipts_amount"),
+            "payout": c.get("expected_output"),
+        })
+    df = pd.DataFrame(rows)
+    df["spend_per_day"] = df["receipts"] / df["days"]
     return df
 
 
-def run_pelt_breakpoints(values: np.ndarray) -> List[int]:
-    algo = rpt.Pelt(model="l2").fit(values)
-    idx = algo.predict(pen=10)
-    # omit last index equal to len(values)
-    return idx[:-1]
+def detect_pelt_breakpoints(df_sorted):
+    """Use PELT to detect breakpoints in spend_per_day vs payout"""
+    series = df_sorted["payout"].values
+    algo = rpt.Pelt(model="l2").fit(series)
+    bkpts = algo.predict(pen=10)  # Adjust penalty as needed
+    
+    # Remove last index which is length of series
+    breakpoint_indices = [i for i in bkpts if i < len(series)]
+    breakpoint_spend_values = df_sorted.loc[breakpoint_indices, "spend_per_day"].tolist()
+    
+    print(f"PELT detected {len(breakpoint_spend_values)} breakpoints:")
+    for spend in breakpoint_spend_values:
+        print(f"  ${spend:.2f}/day")
+    
+    return breakpoint_spend_values
 
 
-def add_spd_segments(df: pd.DataFrame, k1: float, k2: Optional[float] = None) -> pd.DataFrame:
-    """Add piecewise linear segment columns based on knots."""
-    s = df["spd"].values
-    seg1 = np.minimum(s, k1)
-    if k2 is None:
-        seg2 = np.maximum(0, s - k1)
-        seg3 = np.zeros_like(s)
+def select_optimal_knots(df_sorted, candidate_knots, num_knots=5):
+    """Select optimal knots using evenly spaced approach"""
+    # Sort candidates and ensure they're within data range
+    candidates = sorted([k for k in candidate_knots 
+                        if df_sorted["spend_per_day"].min() < k < df_sorted["spend_per_day"].max()])
+    
+    if len(candidates) < num_knots:
+        print(f"Warning: Only {len(candidates)} candidate knots available, using all")
+        selected_knots = candidates
     else:
-        seg2 = np.maximum(0, np.minimum(s, k2) - k1)
-        seg3 = np.maximum(0, s - k2)
-    df = df.copy()
-    df["spd_seg1"] = seg1
-    df["spd_seg2"] = seg2
-    df["spd_seg3"] = seg3
-    return df
+        # Use evenly spaced knots from candidates
+        step = len(candidates) // num_knots
+        selected_knots = [candidates[i*step] for i in range(num_knots)]
+    
+    return selected_knots
 
 
-def fit_hinge(df: pd.DataFrame, k1: float, k2: Optional[float] = None) -> Tuple[float, LinearRegression]:
-    df_seg = add_spd_segments(df, k1, k2)
-    features = ["spd_seg1", "spd_seg2"] if k2 is None else ["spd_seg1", "spd_seg2", "spd_seg3"]
-    X = df_seg[features].values
-    y = df_seg["payout"].values
-    model = LinearRegression().fit(X, y)
-    pred = model.predict(X)
-    rss = np.sum((y - pred) ** 2)
-    n = len(y)
-    p = X.shape[1] + 1
-    aic = n * np.log(rss / n) + 2 * p
-    return aic, model
+def fit_piecewise_model(df_sorted, knots):
+    """Fit piecewise linear model with given knots"""
+    spend_per_day = df_sorted["spend_per_day"].values
+    payout = df_sorted["payout"].values
+    
+    # Create feature matrix
+    X = np.ones((len(spend_per_day), 1))  # intercept
+    for k in knots:
+        X = np.hstack([X, np.maximum(0, spend_per_day.reshape(-1, 1) - k)])
+    
+    # Fit model
+    model = LinearRegression(fit_intercept=False)
+    model.fit(X, payout)
+    
+    # Calculate metrics
+    preds = model.predict(X)
+    r2 = model.score(X, payout)
+    mae = np.mean(np.abs(payout - preds))
+    rmse = np.sqrt(np.mean((payout - preds) ** 2))
+    
+    print(f"\nModel performance:")
+    print(f"  R²: {r2:.4f}")
+    print(f"  MAE: ${mae:.2f}")
+    print(f"  RMSE: ${rmse:.2f}")
+    
+    # Print segment information
+    coeffs = model.coef_
+    print(f"\nPiecewise model segments:")
+    print(f"  Base intercept: ${coeffs[0]:.2f}")
+    
+    cumulative_slope = 0
+    for i, (knot, coeff) in enumerate(zip(knots, coeffs[1:])):
+        cumulative_slope += coeff
+        print(f"  Above ${knot:.0f}/day: slope = {cumulative_slope:.3f}")
+    
+    return model, r2, mae, rmse
 
 
-def choose_one_knot(df: pd.DataFrame, candidates: List[int]) -> Tuple[int, LinearRegression]:
-    best_aic = float("inf")
-    best_k = candidates[0]
-    best_model = None
-    for k in candidates:
-        aic, model = fit_hinge(df, k)
-        if aic < best_aic:
-            best_aic = aic
-            best_k = k
-            best_model = model
-    return best_k, best_model
-
-
-def choose_two_knots(df: pd.DataFrame, candidates: List[int]) -> Tuple[Tuple[int, int], LinearRegression]:
-    pairs = [(c1, c2) for c1 in candidates for c2 in candidates if c1 < c2]
-    best_aic = float("inf")
-    best_pair = pairs[0]
-    best_model = None
-    for k1, k2 in pairs:
-        aic, model = fit_hinge(df, k1, k2)
-        if aic < best_aic:
-            best_aic = aic
-            best_pair = (k1, k2)
-            best_model = model
-    return best_pair, best_model
-
-
-def save_plots(df: pd.DataFrame, output_prefix: str) -> None:
-    plt.figure(figsize=(8, 6))
-    plt.scatter(df["spd"], df["payout"], alpha=0.6)
-    plt.xlabel("Spend per Day")
-    plt.ylabel("Payout")
-    plt.title("Spend per Day vs Payout")
+def create_visualization(df_sorted, knots, model, filename="spend_breakpoints_analysis.png"):
+    """Create visualization of the piecewise model"""
+    spend_range = np.linspace(df_sorted["spend_per_day"].min(), 
+                             df_sorted["spend_per_day"].max(), 1000)
+    
+    # Create prediction for the range
+    X_pred = np.ones((len(spend_range), 1))
+    for k in knots:
+        X_pred = np.hstack([X_pred, np.maximum(0, spend_range.reshape(-1, 1) - k)])
+    
+    payout_pred = model.predict(X_pred)
+    
+    plt.figure(figsize=(14, 10))
+    plt.scatter(df_sorted["spend_per_day"], df_sorted["payout"], alpha=0.6, s=20, label="Training Data")
+    plt.plot(spend_range, payout_pred, 'r-', linewidth=3, label=f"{len(knots)}-knot model")
+    
+    # Mark the knots
+    for i, k in enumerate(knots):
+        plt.axvline(k, color='orange', linestyle='--', alpha=0.8, linewidth=2)
+        plt.text(k, plt.ylim()[1]*0.95, f'${k:.0f}', rotation=90, ha='right', fontsize=10, fontweight='bold')
+    
+    plt.xlabel("Spend per Day ($)", fontsize=12)
+    plt.ylabel("Payout ($)", fontsize=12)
+    plt.title(f"Spend per Day vs Payout - {len(knots)}-Knot Piecewise Model (All {len(df_sorted)} cases)", fontsize=14)
+    plt.legend(fontsize=12)
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig(f"{output_prefix}_scatter.png")
-    plt.close()
-
-    plt.figure(figsize=(8, 6))
-    plt.plot(df["spd"], df["local_slope"], marker="o", linestyle="-")
-    plt.xlabel("Spend per Day")
-    plt.ylabel("Local slope")
-    plt.title("Local Slope of Payout vs Spend per Day")
-    plt.tight_layout()
-    plt.savefig(f"{output_prefix}_slope.png")
-    plt.close()
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    print(f"Visualization saved to: {filename}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Detect spend-per-day breakpoints")
-    parser.add_argument("cases", nargs="?", default="public_cases.json")
-    parser.add_argument("--days-min", type=int, default=4)
-    parser.add_argument("--days-max", type=int, default=6)
-    parser.add_argument("--miles-min", type=float, default=550)
-    parser.add_argument("--miles-max", type=float, default=650)
-    parser.add_argument("--two-knots", action="store_true")
-    args = parser.parse_args()
-
-    df = load_cases(args.cases)
-    df = filter_cases(df, args.days_min, args.days_max, args.miles_min, args.miles_max)
-    df = compute_local_slope(df)
-
-    break_idx = run_pelt_breakpoints(df["payout"].values)
-    break_spd = df.loc[break_idx, "spd"].tolist()
-
-    candidates = [50, 100, 150, 200, 400, 600, 800, 1000]
-
-    if args.two_knots:
-        (k1, k2), model = choose_two_knots(df, candidates)
-    else:
-        k1, model = choose_one_knot(df, candidates)
-        k2 = None
-
-    seg_df = add_spd_segments(df, k1, k2)
-    features = ["spd_seg1", "spd_seg2"] if k2 is None else ["spd_seg1", "spd_seg2", "spd_seg3"]
-    X = seg_df[features].values
-    y = seg_df["payout"].values
-    pred = model.predict(X)
-
-    if k2 is None:
-        slopes = [model.coef_[0], model.coef_[0] + model.coef_[1]]
-    else:
-        slopes = [model.coef_[0], model.coef_[0] + model.coef_[1], model.coef_[0] + model.coef_[1] + model.coef_[2]]
-
-    result = {
-        "knot_1": int(k1),
-        "knot_2": int(k2) if k2 is not None else None,
-        "slope_1": float(slopes[0]),
-        "slope_2": float(slopes[1]),
+def main():
+    cases = load_data()
+    df = build_dataframe(cases)
+    
+    print(f"=== SPEND-PER-DAY BREAKPOINT ANALYSIS ===")
+    print(f"Analyzing all {len(df)} cases")
+    print(f"Spend per day range: ${df['spend_per_day'].min():.2f} - ${df['spend_per_day'].max():.2f}")
+    print(f"Payout range: ${df['payout'].min():.2f} - ${df['payout'].max():.2f}")
+    
+    # Sort by spend_per_day for analysis
+    df_sorted = df.sort_values("spend_per_day").reset_index(drop=True)
+    
+    # Detect breakpoints using PELT
+    pelt_breakpoints = detect_pelt_breakpoints(df_sorted)
+    
+    # Select 5 optimal knots
+    optimal_knots = select_optimal_knots(df_sorted, pelt_breakpoints, num_knots=5)
+    print(f"\nSelected 5 knots: {['${:.0f}'.format(k) for k in optimal_knots]}")
+    
+    # Fit piecewise model
+    model, r2, mae, rmse = fit_piecewise_model(df_sorted, optimal_knots)
+    
+    # Save results
+    results = {
+        "knots": optimal_knots,
+        "pelt_breakpoints": pelt_breakpoints,
+        "num_cases": len(df),
+        "spend_per_day_range": [float(df["spend_per_day"].min()), float(df["spend_per_day"].max())],
+        "model_performance": {
+            "r2": r2,
+            "mae": mae,
+            "rmse": rmse
+        },
+        "coefficients": model.coef_.tolist()
     }
-    if k2 is not None:
-        result["slope_3"] = float(slopes[2])
-    with open("spend_segments.json", "w") as f:
-        json.dump(result, f, indent=2)
-
-    print("Detected breakpoints from PELT:", break_spd)
-    print("Selected knot(s):", k1 if k2 is None else (k1, k2))
-    print("Slopes:", slopes)
-
-    df["fitted"] = pred
-    save_plots(df, "spend")
+    
+    with open("spend_5knots_analysis.json", "w") as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\nResults saved to: spend_5knots_analysis.json")
+    
+    # Create visualization
+    create_visualization(df_sorted, optimal_knots, model)
 
 
 if __name__ == "__main__":
